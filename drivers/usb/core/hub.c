@@ -1061,9 +1061,30 @@ void usb_disconnect(struct usb_device **pdev)
 	device_unregister(&udev->dev);
 }
 
+static int choose_power( int power, int versus )
+{
+	/* Prefer configurations <= 100mA. */
+	if( power > 50 && versus <= 50 )
+		return 0;
+	if( power <= 50 && versus > 50 )
+		return 1;
+
+	/* For configurations under <= 100mA, prefer higher power usage, to avoid
+	 * using very low-power modes; a bus-powered hub can supply 100mA.  For
+	 * configurations > 100mA, prefer lower power usage.  This way, we prefer
+	 * a configuration we know we can drive on our hub, and we use the best
+	 * bet if none are low enough.  (Some USB sticks only report a 200mA mode,
+	 * but work anyway.) */
+	if( power <= 50 )
+		return power > versus;
+	else
+		return power < versus;
+}
+
 static int choose_configuration(struct usb_device *udev)
 {
 	int c, i;
+	int power_of_c = 99999999;
 
 	/* NOTE: this should interact with hub power budgeting */
 
@@ -1079,6 +1100,21 @@ static int choose_configuration(struct usb_device *udev)
 					->altsetting->desc;
 			if (desc->bInterfaceClass == USB_CLASS_VENDOR_SPEC)
 				continue;
+
+			dev_info(&udev->dev,
+					"configuration #%d: %dmA\n",
+					udev->config[i].desc.bConfigurationValue, udev->config[i].desc.bMaxPower*2);
+
+			/* Prefer configurations <= 100mA. */
+			if( !choose_power(udev->config[i].desc.bMaxPower, power_of_c) )
+			{
+				dev_info(&udev->dev, "configuration skipped (%imA vs preferred %imA)\n",
+						udev->config[i].desc.bMaxPower*2,
+						power_of_c*2);
+
+				continue;
+			}
+			
 			/* COMM/2/all is CDC ACM, except 0xff is MSFT RNDIS.
 			 * MSFT needs this to be the first config; never use
 			 * it as the default unless Linux has host-side RNDIS.
@@ -1093,7 +1129,7 @@ static int choose_configuration(struct usb_device *udev)
 				continue;
 			}
 			c = udev->config[i].desc.bConfigurationValue;
-			break;
+			power_of_c = udev->config[i].desc.bMaxPower;
 		}
 		dev_info(&udev->dev,
 			"configuration #%d chosen from %d choices\n",
@@ -2791,6 +2827,8 @@ loop:
 		usb_unlock_device(hdev);
 		usb_put_intf(intf);
 
+		/* ITG: work around khubd looping on a semaphore, which can stall processes */
+		msleep(25);
         } /* end while (1) */
 }
 

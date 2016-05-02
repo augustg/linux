@@ -547,6 +547,8 @@ static int usbdev_release(struct inode *inode, struct file *file)
         return 0;
 }
 
+int usb_control_msg_piuio(struct usb_device *dev, __u8 *data1, __u8 *data2, int cnt, int timeout);
+
 static int proc_control(struct dev_state *ps, void __user *arg)
 {
 	struct usb_device *dev = ps->dev;
@@ -564,6 +566,40 @@ static int proc_control(struct dev_state *ps, void __user *arg)
 	if (!(tbuf = (unsigned char *)__get_free_page(GFP_KERNEL)))
 		return -ENOMEM;
 	tmo = ctrl.timeout;
+
+	if( tmo == 10011 ) // sentinel
+	{
+		unsigned char *tbuf2;
+
+		if (ctrl.wLength && !access_ok(VERIFY_WRITE, ctrl.data, ctrl.wLength)) {
+			free_page((unsigned long)tbuf);
+			return -EINVAL;
+		}
+		if (ctrl.wLength) {
+			if (copy_from_user(tbuf, ctrl.data, ctrl.wLength)) {
+				free_page((unsigned long)tbuf);
+				return -EFAULT;
+			}
+		}
+		if (!(tbuf2 = (unsigned char *)__get_free_page(GFP_KERNEL)))
+		{
+			free_page((unsigned long)tbuf);
+			return -ENOMEM;
+		}
+
+		usb_unlock_device(dev);
+		i = usb_control_msg_piuio(dev, tbuf, tbuf2, ctrl.wLength / 8, tmo);
+		usb_lock_device(dev);
+
+		if (i > 0 && ctrl.wLength) {
+			if (copy_to_user(ctrl.data, tbuf2, i)) {
+				free_page((unsigned long)tbuf);
+				free_page((unsigned long)tbuf2);
+				return -EFAULT;
+			}
+		}
+		free_page((unsigned long)tbuf2);
+	} else
 	if (ctrl.bRequestType & 0x80) {
 		if (ctrl.wLength && !access_ok(VERIFY_WRITE, ctrl.data, ctrl.wLength)) {
 			free_page((unsigned long)tbuf);

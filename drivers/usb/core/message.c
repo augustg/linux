@@ -164,6 +164,231 @@ int usb_control_msg(struct usb_device *dev, unsigned int pipe, __u8 request, __u
 }
 
 
+/////////
+
+struct completion_t
+{
+	atomic_t remaining;
+	struct completion done;
+};
+
+static void usb_api_blocking_completion_n(struct urb *urb, struct pt_regs *regs)
+{
+	struct completion_t *compl = (struct completion_t *)urb->context;
+
+	atomic_dec(&compl->remaining);
+	if(!atomic_read(&compl->remaining))
+		complete(&compl->done);
+}
+
+struct urbs_t
+{
+	struct urb **urbs;
+	int cnt;
+};
+
+static void timeout_kill_n(unsigned long data)
+{
+	struct urbs_t *urbs = (struct urbs_t *) data;
+	int i;
+	for (i = 0; i < urbs->cnt; ++i)
+		usb_unlink_urb(urbs->urbs[i]);
+}
+
+/* Start multiple urbs (with the same length), and wait for them all to complete.  Return
+ * the first error, otherwise 0. */
+static int usb_start_wait_urb_n(struct urb **urb, int cnt, int timeout, int* actual_length)
+{
+	struct completion_t	wait;
+	struct timer_list       timer;
+	int                     status;
+	int			i;
+
+	atomic_set(&wait.remaining, cnt);
+	init_completion(&wait.done);
+
+	for (i = 0; i < cnt; ++i) {
+		urb[i]->context = &wait;
+		urb[i]->actual_length = 0;
+		status = usb_submit_urb(urb[i], GFP_NOIO);
+		if (status != 0) {
+			while( i-- )
+				usb_unlink_urb(urb[i]);
+			return status;
+		}
+	}
+
+	struct urbs_t urbs;
+	urbs.urbs = urb;
+	urbs.cnt = cnt;
+	if (timeout > 0) {
+		init_timer(&timer);
+		timer.expires = jiffies + msecs_to_jiffies(timeout);
+		timer.data = (unsigned long)&urbs;
+		timer.function = timeout_kill_n;
+		add_timer(&timer);
+	}
+
+	wait_for_completion(&wait.done);
+
+	status = 0;
+	for (i = 0; i < cnt; ++i) {
+		if(urb[i]->status == 0)
+			continue;
+
+		status = urb[i]->status;
+
+		/* note:  HCDs return ETIMEDOUT for other reasons too */
+		if (status == -ECONNRESET) {
+			dev_dbg(&urb[i]->dev->dev,
+					"%s timed out on ep%d%s len=%d/%d\n",
+					current->comm,
+					usb_pipeendpoint(urb[i]->pipe),
+					usb_pipein(urb[i]->pipe) ? "in" : "out",
+					urb[i]->actual_length,
+					urb[i]->transfer_buffer_length
+			       );
+			status = -ETIMEDOUT;
+		}
+
+		break;
+	}
+
+	if (timeout > 0)
+		del_timer_sync(&timer);
+
+	*actual_length = urb[0]->actual_length;
+
+	return status;
+}
+
+int usb_internal_control_msg_n(struct usb_device *dev, int cnt, struct usb_ctrlrequest *rq, void **data, int timeout)
+{
+        struct usb_ctrlrequest **dr = NULL;
+	struct urb **urb = NULL;
+        int ret;
+	int i;
+
+	dr = kmalloc(sizeof(struct usb_ctrlrequest *)*cnt, GFP_NOIO);
+	urb = kmalloc(sizeof(struct urb *)*cnt, GFP_NOIO);
+	if (!dr || !urb)
+	{
+		ret = -ENOMEM;
+		goto exit;
+	}
+	memset(dr, 0, sizeof(struct usb_ctrlrequest *)*cnt);
+	memset(urb, 0, sizeof(struct urb *)*cnt);
+
+	for(i = 0; i < cnt; ++i)
+	{
+		dr[i] = kmalloc(sizeof(struct usb_ctrlrequest), GFP_NOIO);
+		urb[i] = usb_alloc_urb(0, GFP_NOIO);
+		if (!dr[i] || !urb[i])
+		{
+			ret = -ENOMEM;
+			goto exit;
+		}
+	}
+
+	for(i = 0; i < cnt; ++i)
+	{
+		memcpy(dr[i], &rq[i], sizeof(struct usb_ctrlrequest));
+
+		int pipe;
+		if (dr[i]->bRequestType & 0x80)
+			pipe = usb_rcvctrlpipe(dev, 0);
+		else
+			pipe = usb_sndctrlpipe(dev, 0);
+		usb_fill_control_urb(urb[i], dev, pipe, (unsigned char *)dr[i], data[i],
+				le16_to_cpu(dr[i]->wLength), usb_api_blocking_completion_n, NULL);
+	}
+
+	int length;
+	ret = usb_start_wait_urb_n(urb, cnt, timeout, &length);
+	if (ret == 0)
+		ret = length;
+
+exit:
+	if(dr)
+		for(i = 0; i < cnt; ++i)
+			kfree(dr[i]);
+	kfree(dr);
+	if(urb)
+		for (i = 0; i < cnt; ++i)
+			usb_free_urb(urb[i]);
+	kfree(urb);
+
+        return ret;
+}
+
+int usb_control_msg_piuio(struct usb_device *dev, __u8 *data1, __u8 *data2, int cnt, int timeout)
+{
+	struct usb_ctrlrequest *rq;
+	void **data;
+	int ret;
+	rq = kmalloc(sizeof(struct usb_ctrlrequest)*cnt*2, GFP_NOIO);
+	data = kmalloc(sizeof(void *)*cnt*2, GFP_NOIO);
+	if (!rq || !data)
+	{
+		ret = -ENOMEM;
+		goto out;
+	}
+	memset(rq, 0, sizeof(struct usb_ctrlrequest)*cnt*2);
+	memset(data, 0, sizeof(void *)*cnt*2);
+
+	/* Write one packet from data1, then read one packet into data2. */
+	int i;
+	for (i = 0; i < cnt; ++i)
+	{
+		rq[i*2+0].bRequestType = USB_TYPE_VENDOR;
+		rq[i*2+0].bRequest = 0xAE;
+		rq[i*2+0].wValue = 0;
+		rq[i*2+0].wIndex = 0;
+		rq[i*2+0].wLength = cpu_to_le16(8);
+		data[i*2+0] = data1+i*8;
+
+		rq[i*2+1].bRequestType = USB_DIR_IN|USB_TYPE_VENDOR;
+		rq[i*2+1].bRequest = 0xAE;
+		rq[i*2+1].wValue = 0;
+		rq[i*2+1].wIndex = 0;
+		rq[i*2+1].wLength = cpu_to_le16(8);
+		data[i*2+1] = data2+i*8;
+	}
+
+	ret = usb_internal_control_msg_n(dev, cnt*2, rq, data, timeout);
+	if (ret > 0)
+		ret *= cnt;
+out:
+	kfree(rq);
+	kfree(data);
+	return ret;
+}
+/*
+int usb_control_msg_piuio(struct usb_device *dev, void *data1, void *data2, int timeout)
+{
+	struct usb_ctrlrequest rq[] =
+	{
+		{
+			bRequestType: USB_TYPE_VENDOR,
+			bRequest: 0xAE,
+			wValue: 0,
+			wIndex: 0,
+			wLength: cpu_to_le16(8)
+		},
+		{
+			bRequestType: USB_DIR_IN|USB_TYPE_VENDOR,
+			bRequest: 0xAE,
+			wValue: 0,
+			wIndex: 0,
+			wLength: cpu_to_le16(8)
+		}
+	};
+	void *data[] = { data1, data2 };
+	return usb_internal_control_msg_n(dev, 2, rq, data, timeout);
+}
+*/
+
+
 /**
  *	usb_bulk_msg - Builds a bulk urb, sends it off and waits for completion
  *	@usb_dev: pointer to the usb device to send the message to

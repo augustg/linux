@@ -68,7 +68,34 @@ static inline char mon_text_get_data(struct mon_event_text *ep, struct urb *urb,
     int len, char ev_type)
 {
 	int pipe = urb->pipe;
-	unsigned char *data;
+
+	if (len <= 0)
+		return 'L';
+	if (len >= DATA_MAX)
+		len = DATA_MAX;
+
+	if (usb_pipecontrol(pipe)) {
+		if (ev_type == 'S') {
+			memcpy(ep->data, urb->setup_packet, sizeof(struct usb_ctrlrequest));
+			ep->length = sizeof(struct usb_ctrlrequest);
+			return 0;
+		}
+	}
+
+	/*
+	 * Bulk is easy to shortcut reliably. 
+	 * XXX Other pipe types need consideration. Currently, we overdo it
+	 * and collect garbage for them: better more than less.
+	 */
+	if (usb_pipebulk(pipe)) {
+		if (usb_pipein(pipe)) {
+			if (ev_type == 'S')
+				return '<';
+		} else {
+			if (ev_type == 'C')
+				return '>';
+		}
+	}
 
 	/*
 	 * The check to see if it's safe to poke at data has an enormous
@@ -80,32 +107,11 @@ static inline char mon_text_get_data(struct mon_event_text *ep, struct urb *urb,
 	 * set DMA for the HCD.
 	 */
 	if (urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)
-		return 'D';
+		return mon_dmapeek(ep->data, urb->transfer_dma, len);
 
-	if (len <= 0)
-		return 'L';
-
-	if ((data = urb->transfer_buffer) == NULL)
+	if (urb->transfer_buffer == NULL)
 		return 'Z';	/* '0' would be not as pretty. */
 
-	/*
-	 * Bulk is easy to shortcut reliably. 
-	 * XXX Control needs setup packet taken.
-	 * XXX Other pipe types need consideration. Currently, we overdo it
-	 * and collect garbage for them: better more than less.
-	 */
-	if (usb_pipebulk(pipe) || usb_pipecontrol(pipe)) {
-		if (usb_pipein(pipe)) {
-			if (ev_type == 'S')
-				return '<';
-		} else {
-			if (ev_type == 'C')
-				return '>';
-		}
-	}
-
-	if (len >= DATA_MAX)
-		len = DATA_MAX;
 	memcpy(ep->data, urb->transfer_buffer, len);
 	return 0;
 }
